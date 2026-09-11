@@ -9,10 +9,10 @@
 #include <linux/security.h>
 #include <linux/uaccess.h>
 #include <linux/compat.h>
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#ifdef CONFIG_KSU_SUSFS
 #include <linux/susfs_def.h>
 #include "mount.h"
-#endif
+#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
 #include "internal.h"
 
 static int flags_by_mnt(int mnt_flags)
@@ -71,26 +71,76 @@ static int statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf)
 	return retval;
 }
 
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
+extern int susfs_sus_kstat_spoof_vfs_statfs(struct inode *inode, struct kstatfs *buf, bool *is_fuse);
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt);
+#endif //#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+static int susfs_statfs_by_dentry(struct dentry *dentry, struct kstatfs *buf, bool *is_fuse)
+{
+	int retval;
+
+	if (!dentry->d_sb->s_op->statfs)
+		return -ENOSYS;
+
+	memset(buf, 0, sizeof(*buf));
+	retval = security_sb_statfs(dentry);
+	if (retval)
+		return retval;
+	if (susfs_sus_kstat_spoof_vfs_statfs(d_backing_inode(dentry), buf, is_fuse))
+		goto orig_flow;
+	retval = dentry->d_sb->s_op->statfs(dentry, buf);
+orig_flow:
+	if (retval == 0 && buf->f_frsize == 0)
+		buf->f_frsize = buf->f_bsize;
+	return retval;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+
 int vfs_statfs(const struct path *path, struct kstatfs *buf)
 {
 	int error;
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	struct mount *mnt;
-
-	mnt = real_mount(path->mnt);
-	if (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC)) {
-		for (; mnt->mnt_id >= DEFAULT_SUS_MNT_ID; mnt = mnt->mnt_parent) {}
+#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+	if (susfs_is_current_app_uid()) {
+		struct inode *inode = d_backing_inode(path->dentry);
+		bool is_fuse = false;
+		if (susfs_is_inode_sus_kstat(inode, &is_fuse)) {
+			error = susfs_statfs_by_dentry(path->dentry, buf, &is_fuse);
+			goto bypass_orig_flow;
+		}
 	}
-	error = statfs_by_dentry(mnt->mnt.mnt_root, buf);
-	if (!error)
-		buf->f_flags = calculate_f_flags(&mnt->mnt);
-	return error;
-#else
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	if (likely(susfs_is_current_proc_umounted())) {
+		struct vfsmount *no_sus_vfsmnt = NULL;
+		no_sus_vfsmnt = susfs_get_non_sus_vfsmnt_from_vfsmnt(path->mnt);
+		if (path->mnt == no_sus_vfsmnt) {
+			dput(no_sus_vfsmnt->mnt_root);
+			mntput(no_sus_vfsmnt);
+			error = statfs_by_dentry(path->dentry, buf);
+			goto bypass_orig_flow;
+	}
+		error = statfs_by_dentry(no_sus_vfsmnt->mnt_root, buf);
+		if (!error)
+			buf->f_flags = calculate_f_flags(no_sus_vfsmnt);
+		dput(no_sus_vfsmnt->mnt_root);
+		mntput(no_sus_vfsmnt);
+		return error;
+	}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+
 	error = statfs_by_dentry(path->dentry, buf);
+#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
+bypass_orig_flow:
+#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
 	if (!error)
 		buf->f_flags = calculate_f_flags(path->mnt);
 	return error;
-#endif
 }
 EXPORT_SYMBOL(vfs_statfs);
 
@@ -109,22 +159,6 @@ retry:
 			goto retry;
 		}
 	}
-#ifdef CONFIG_KSU_SUSFS_SUS_OVERLAYFS
-	/* - When mounting overlay, the f_flags are set with 'ro' and 'relatime',
-	 *   but this is an abnormal status, as when we inspect the output from mountinfo,
-	 *   we will find that all partitions set with 'ro' will have 'noatime' set as well.
-	 * - But what is strange here is that the vfsmnt f_flags of the lowest layer has corrent f_flags set,
-	 *   and still it is always changed to 'relatime' instead of 'noatime' for the final result,
-	 *   I can't think of any other reason to explain about this, maybe the f_flags is set by its own
-	 *   filesystem implementation but not the one from overlayfs.
-	 * - Anyway we just cannot use the retrieved f_flags from ovl_getattr() of overlayfs,
-	 *   we need to run one more check for user_statfs() and fd_statfs() by ourselves.
-	 */
-	if (unlikely((st->f_flags & ST_RDONLY) && (st->f_flags & ST_RELATIME))) {
-		st->f_flags &= ~ST_RELATIME;
-		st->f_flags |= ST_NOATIME;
-	}
-#endif
 	return error;
 }
 
@@ -136,12 +170,6 @@ int fd_statfs(int fd, struct kstatfs *st)
 		error = vfs_statfs(&f.file->f_path, st);
 		fdput(f);
 	}
-#ifdef CONFIG_KSU_SUSFS_SUS_OVERLAYFS
-	if (unlikely((st->f_flags & ST_RDONLY) && (st->f_flags & ST_RELATIME))) {
-		st->f_flags &= ~ST_RELATIME;
-		st->f_flags |= ST_NOATIME;
-	}
-#endif
 	return error;
 }
 
@@ -262,11 +290,6 @@ static int vfs_ustat(dev_t dev, struct kstatfs *sbuf)
 	if (!s)
 		return -EINVAL;
 
-#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-	if (unlikely(s->s_root->d_inode->i_state & INODE_STATE_SUS_MOUNT)) {
-		return -EINVAL;
-	}
-#endif
 	err = statfs_by_dentry(s->s_root, sbuf);
 	drop_super(s);
 	return err;
